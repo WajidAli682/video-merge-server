@@ -58,10 +58,53 @@ async function downloadFile(url, destPath) {
   fs.writeFileSync(destPath, Buffer.from(arrayBuf));
 }
 
+// ffprobe se clip ka width/height/fps/codec nikalo (JSON output)
+function probeClip(filePath) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-v', 'error',
+      '-select_streams', 'v:0',
+      '-show_entries', 'stream=width,height,r_frame_rate,codec_name',
+      '-of', 'json',
+      filePath
+    ];
+    const proc = spawn('ffprobe', args);
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', d => { stdout += d.toString(); });
+    proc.stderr.on('data', d => { stderr += d.toString(); });
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`ffprobe failed: ${stderr.slice(-500)}`));
+        return;
+      }
+      try {
+        const data = JSON.parse(stdout);
+        const stream = data.streams?.[0];
+        if (!stream) {
+          reject(new Error('ffprobe: no video stream found'));
+          return;
+        }
+        // r_frame_rate aata hai "25/1" jaisa string format mein, usko number mein convert karo
+        const [num, den] = (stream.r_frame_rate || '25/1').split('/').map(Number);
+        const fps = den ? Math.round((num / den) * 100) / 100 : num;
+        resolve({
+          width: stream.width,
+          height: stream.height,
+          fps,
+          codec: stream.codec_name
+        });
+      } catch (e) {
+        reject(new Error(`ffprobe parse error: ${e.message}`));
+      }
+    });
+  });
+}
+
 // ── Core pipeline ────────────────────────────────────────────────────────────
-const TARGET_W = 1920;
-const TARGET_H = 1080;
-const TARGET_FPS = 30;
+// (Target resolution/fps ab per-job dynamically decide hota hai — sabse
+// common format ko target banaya jata hai taake kam se kam clips re-encode hon)
 
 async function processJob(jobId, clips) {
   const jobDir = path.join(STORAGE_DIR, jobId);
@@ -74,37 +117,97 @@ async function processJob(jobId, clips) {
     const rawPath = path.join(jobDir, `raw_${i}.mp4`);
     await downloadFile(clips[i].url, rawPath);
     rawPaths.push(rawPath);
-    setJob(jobId, { progress: Math.round(((i + 1) / clips.length) * 30) }); // 0-30%
+    setJob(jobId, { progress: Math.round(((i + 1) / clips.length) * 20) }); // 0-20%
   }
 
-  // Step 2 — Trim (agar zaroori ho) + normalize har clip ek common
-  // format/resolution/fps mein, taake concat mein fail na ho.
-  setJob(jobId, { status: 'processing' });
+  // Step 2 — Har clip ka asal resolution/fps/codec probe karo (ffprobe se),
+  // taake pata chale konsi clips already same format mein hain — unhe
+  // re-encode karne ki zaroorat nahi, sirf jo alag hain unhi ko normalize karo.
+  setJob(jobId, { status: 'analyzing', progress: 22 });
+  const probes = [];
+  for (let i = 0; i < rawPaths.length; i++) {
+    try {
+      const info = await probeClip(rawPaths[i]);
+      probes.push(info);
+    } catch (e) {
+      console.warn(`[Job ${jobId}] Probe failed for clip ${i}, will normalize as fallback:`, e.message);
+      probes.push(null); // null = unknown, force normalize
+    }
+  }
+
+  // Sabse common resolution/fps dhundo (jo zyada clips mein match karta hai)
+  // — usi ko target bana lo, taake kam se kam clips ko touch karna pade.
+  const validProbes = probes.filter(p => p !== null);
+  const counts = {};
+  validProbes.forEach(p => {
+    const key = `${p.width}x${p.height}@${p.fps}|${p.codec}`;
+    counts[key] = (counts[key] || 0) + 1;
+  });
+  let targetKey = null;
+  let maxCount = 0;
+  for (const [key, count] of Object.entries(counts)) {
+    if (count > maxCount) { maxCount = count; targetKey = key; }
+  }
+
+  let TARGET_W, TARGET_H, TARGET_FPS;
+  if (targetKey) {
+    const [res, codec] = targetKey.split('|');
+    const [wh, fps] = res.split('@');
+    [TARGET_W, TARGET_H] = wh.split('x').map(Number);
+    TARGET_FPS = Number(fps);
+  } else {
+    // Koi clip probe nahi ho saki — safe default
+    TARGET_W = 1920; TARGET_H = 1080; TARGET_FPS = 30;
+  }
+
+  console.log(`[Job ${jobId}] Target format: ${TARGET_W}x${TARGET_H}@${TARGET_FPS} (${maxCount}/${clips.length} clips already match)`);
+
+  // Step 3 — Trim (agar zaroori ho) + sirf jo clips target se mismatch hain unhi ko normalize karo.
+  // Matching clips ko bas trim karo (-c copy se, fast aur lossless) ya as-is rakho.
+  setJob(jobId, { status: 'processing', progress: 25 });
   const normPaths = [];
   for (let i = 0; i < clips.length; i++) {
     const clip = clips[i];
     const inPath = rawPaths[i];
+    const probe = probes[i];
     const outPath = path.join(jobDir, `norm_${i}.mp4`);
+    const needsTrim = !!(clip.trimNeeded && clip.trimEnd);
+
+    const matchesTarget = probe &&
+      probe.width === TARGET_W &&
+      probe.height === TARGET_H &&
+      Math.abs(probe.fps - TARGET_FPS) < 0.5 &&
+      probe.codec === 'h264';
 
     const args = ['-y', '-i', inPath];
+    if (needsTrim) args.push('-t', String(clip.trimEnd));
 
-    // Avatar clips poori rakho. Stock-footage jo trim hui thi, sirf
-    // [0, trimEnd] tak kaato — sceneDuration/trimEnd extension se aata hai.
-    if (clip.trimNeeded && clip.trimEnd) {
-      args.push('-t', String(clip.trimEnd));
+    if (matchesTarget) {
+      // Already sahi format mein — bas trim karo (ya copy), re-encode mat karo.
+      // Yahi step quality 100% original rakhta hai jahan possible ho.
+      if (needsTrim) {
+        args.push('-c', 'copy', '-avoid_negative_ts', 'make_zero', outPath);
+      } else {
+        // Trim bhi nahi chahiye aur format bhi match — seedha copy
+        fs.copyFileSync(inPath, outPath);
+        normPaths.push(outPath);
+        setJob(jobId, { progress: 25 + Math.round(((i + 1) / clips.length) * 55) });
+        continue;
+      }
+    } else {
+      // Format mismatch — normalize karna padega target ke hisaab se
+      args.push(
+        '-vf', `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${TARGET_FPS}`,
+        '-c:v', 'libx264', '-preset', 'slow', '-crf', '17',
+        '-threads', '2', '-x264-params', 'threads=2:lookahead_threads=1',
+        '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
+        outPath
+      );
     }
-
-    args.push(
-      '-vf', `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${TARGET_FPS}`,
-      '-c:v', 'libx264', '-preset', 'slow', '-crf', '17',
-      '-threads', '2', '-x264-params', 'threads=2:lookahead_threads=1',
-      '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
-      outPath
-    );
 
     await run('ffmpeg', args);
     normPaths.push(outPath);
-    setJob(jobId, { progress: 30 + Math.round(((i + 1) / clips.length) * 50) }); // 30-80%
+    setJob(jobId, { progress: 25 + Math.round(((i + 1) / clips.length) * 55) }); // 25-80%
   }
 
   // Step 3 — Concat (sab ek hi format mein hain ab, isliye -c copy safe hai)
