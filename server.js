@@ -195,9 +195,11 @@ async function processJob(jobId, clips) {
         continue;
       }
     } else {
-      // Format mismatch — normalize karna padega target ke hisaab se
+      // increase + crop: clip ko itna scale karo ke target ko POORA bhar de
+      // (chhota side match), phir extra hissa center se crop kar do.
+      // Isse black bars nahi aate — bas thoda zoom-in effect hota hai.
       args.push(
-        '-vf', `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${TARGET_FPS}`,
+        '-vf', `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase,crop=${TARGET_W}:${TARGET_H},setsar=1,fps=${TARGET_FPS}`,
         '-c:v', 'libx264', '-preset', 'slow', '-crf', '17',
         '-threads', '2', '-x264-params', 'threads=2:lookahead_threads=1',
         '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
