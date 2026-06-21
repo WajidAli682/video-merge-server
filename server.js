@@ -12,7 +12,7 @@ const { spawn } = require('child_process');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '10mb' }));
 
 const STORAGE_DIR = path.join(__dirname, 'storage');
 if (!fs.existsSync(STORAGE_DIR)) fs.mkdirSync(STORAGE_DIR, { recursive: true });
@@ -106,7 +106,7 @@ function probeClip(filePath) {
 // (Target resolution/fps ab per-job dynamically decide hota hai — sabse
 // common format ko target banaya jata hai taake kam se kam clips re-encode hon)
 
-async function processJob(jobId, clips) {
+async function processJob(jobId, clips, audioClips) {
   const jobDir = path.join(STORAGE_DIR, jobId);
   fs.mkdirSync(jobDir, { recursive: true });
 
@@ -213,15 +213,75 @@ async function processJob(jobId, clips) {
   }
 
   // Step 3 — Concat (sab ek hi format mein hain ab, isliye -c copy safe hai)
-  setJob(jobId, { status: 'merging', progress: 85 });
+  // Ye video-only-effectively step hai — har clip ka apna audio (avatar ki
+  // awaaz ya footage ka silent track) abhi bhi andar hai, isko Step 4 mein
+  // poori video ke liye ek single continuous narration audio se replace karenge.
+  setJob(jobId, { status: 'merging', progress: 80 });
   const listFile = path.join(jobDir, 'concat_list.txt');
   const listContent = normPaths
     .map(p => `file '${p.replace(/'/g, "'\\''")}'`)
     .join('\n');
   fs.writeFileSync(listFile, listContent);
 
-  const finalPath = path.join(jobDir, 'final.mp4');
-  await run('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listFile, '-c', 'copy', finalPath]);
+  const videoOnlyPath = path.join(jobDir, 'video_only.mp4');
+  await run('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listFile, '-c', 'copy', videoOnlyPath]);
+
+  let finalPath = videoOnlyPath;
+
+  // Step 4 — Narration audio (TTS clips) download + concat + overlay.
+  // Har scene ka apna chhota .wav hai jo timeline order mein sequence se
+  // jodne par poori video ki continuous narration ban jata hai (jaisa
+  // editor mein sunai deti hai). Clips ka apna audio (avatar/footage)
+  // discard karke isi master-audio ko poori video par laga dete hain.
+  if (Array.isArray(audioClips) && audioClips.length > 0) {
+    setJob(jobId, { status: 'audio', progress: 85 });
+
+    const audioRawPaths = [];
+    for (let i = 0; i < audioClips.length; i++) {
+      const audioPath = path.join(jobDir, `audio_${i}.wav`);
+      await downloadFile(audioClips[i].url, audioPath);
+      audioRawPaths.push(audioPath);
+    }
+
+    const audioListFile = path.join(jobDir, 'audio_concat_list.txt');
+    const audioListContent = audioRawPaths
+      .map(p => `file '${p.replace(/'/g, "'\\''")}'`)
+      .join('\n');
+    fs.writeFileSync(audioListFile, audioListContent);
+
+    const masterAudioPath = path.join(jobDir, 'master_audio.aac');
+    // Audio files ko concat karo aur AAC mein encode karo (video container ke liye)
+    await run('ffmpeg', [
+      '-y', '-f', 'concat', '-safe', '0', '-i', audioListFile,
+      '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
+      masterAudioPath
+    ]);
+
+    // Video ke apne audio (-an se hata do) ko master-audio se replace karo.
+    // -shortest: jo bhi (video/audio) chota ho usi tak final video banegi,
+    // taake koi silent ya black trailing hissa na bache agar lengths thoda
+    // mismatch hon (rounding ki wajah se chhote farak ho sakte hain).
+    const withAudioPath = path.join(jobDir, 'final.mp4');
+    await run('ffmpeg', [
+      '-y',
+      '-i', videoOnlyPath,
+      '-i', masterAudioPath,
+      '-map', '0:v:0', '-map', '1:a:0',
+      '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+      '-shortest',
+      withAudioPath
+    ]);
+
+    finalPath = withAudioPath;
+
+    // Audio intermediate files cleanup
+    for (const p of [...audioRawPaths, audioListFile, masterAudioPath]) {
+      try { fs.unlinkSync(p); } catch (_) {}
+    }
+    if (finalPath !== videoOnlyPath) {
+      try { fs.unlinkSync(videoOnlyPath); } catch (_) {}
+    }
+  }
 
   // Cleanup intermediate files (sirf final.mp4 rakho, disk space bachao)
   for (const p of [...rawPaths, ...normPaths, listFile]) {
@@ -231,7 +291,7 @@ async function processJob(jobId, clips) {
   setJob(jobId, {
     status: 'done',
     progress: 100,
-    downloadUrl: `/files/${jobId}/final.mp4`
+    downloadUrl: `/files/${jobId}/${path.basename(finalPath)}`
   });
 }
 
@@ -241,7 +301,7 @@ app.get('/', (req, res) => {
 });
 
 app.post('/merge', (req, res) => {
-  const { clips } = req.body || {};
+  const { clips, audio } = req.body || {};
 
   if (!Array.isArray(clips) || clips.length === 0) {
     return res.status(400).json({ error: 'clips array required: [{url, type, trimEnd, trimNeeded}, ...]' });
@@ -249,6 +309,8 @@ app.post('/merge', (req, res) => {
   for (const c of clips) {
     if (!c.url) return res.status(400).json({ error: 'Har clip mein url chahiye' });
   }
+
+  const audioClips = Array.isArray(audio) ? audio.filter(a => a && a.url) : [];
 
   const jobId = uuidv4();
   setJob(jobId, {
@@ -261,7 +323,7 @@ app.post('/merge', (req, res) => {
   res.json({ jobId });
 
   // Background mein process karo, response pehle hi bhej diya
-  processJob(jobId, clips).catch(err => {
+  processJob(jobId, clips, audioClips).catch(err => {
     console.error(`[Job ${jobId}] FAILED:`, err.message);
     setJob(jobId, { status: 'error', error: err.message });
   });
