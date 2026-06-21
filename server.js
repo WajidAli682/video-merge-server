@@ -96,9 +96,9 @@ async function processJob(jobId, clips) {
 
     args.push(
       '-vf', `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${TARGET_FPS}`,
-      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+      '-c:v', 'libx264', '-preset', 'slow', '-crf', '17',
       '-threads', '2', '-x264-params', 'threads=2:lookahead_threads=1',
-      '-c:a', 'aac', '-ar', '44100', '-ac', '2',
+      '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
       outPath
     );
 
