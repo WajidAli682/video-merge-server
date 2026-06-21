@@ -34,9 +34,19 @@ function run(cmd, args) {
     let stderr = '';
     proc.stderr.on('data', d => { stderr += d.toString(); });
     proc.on('error', reject);
-    proc.on('close', code => {
-      if (code === 0) resolve();
-      else reject(new Error(`${cmd} exited with code ${code}: ${stderr.slice(-1500)}`));
+    proc.on('close', (code, signal) => {
+      if (code === 0) {
+        resolve();
+      } else if (signal) {
+        // code null + signal set = process ko OS ne kill kiya — Railway pe
+        // ye almost hamesha OOM (memory limit) ki wajah se hota hai.
+        const hint = signal === 'SIGKILL'
+          ? ' (signal SIGKILL — server memory limit se zyada use ho gayi, isliye process kill hua. Railway plan ka RAM badhao ya ffmpeg ka resource usage kam karo.)'
+          : '';
+        reject(new Error(`${cmd} killed by signal ${signal}${hint}: ${stderr.slice(-1500)}`));
+      } else {
+        reject(new Error(`${cmd} exited with code ${code}: ${stderr.slice(-1500)}`));
+      }
     });
   });
 }
@@ -87,6 +97,7 @@ async function processJob(jobId, clips) {
     args.push(
       '-vf', `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${TARGET_FPS}`,
       '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+      '-threads', '2', '-x264-params', 'threads=2:lookahead_threads=1',
       '-c:a', 'aac', '-ar', '44100', '-ac', '2',
       outPath
     );
