@@ -204,6 +204,9 @@ async function processJob(jobId, clips, audioClips) {
       );
       await run('ffmpeg', args);
     }
+    // Per-clip log — trim decision track karo
+    const actualDur = await probeDuration(outPath).catch(() => null);
+    console.log(`[Job ${jobId}] Clip ${i+1}/${clips.length}: type=${clip.type} matchesTarget=${!!matchesTarget} needsTrim=${needsTrim} trimEnd=${clip.trimEnd?.toFixed(3) ?? 'null'} actualDur=${actualDur?.toFixed(3) ?? 'err'}`);
     normPaths.push(outPath);
     setJob(jobId, { progress: 25 + Math.round(((i + 1) / clips.length) * 55) });
   }
