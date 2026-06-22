@@ -180,7 +180,16 @@ async function processJob(jobId, clips, audioClips) {
 
     if (matchesTarget) {
       if (needsTrim) {
-        args.push('-c', 'copy', '-avoid_negative_ts', 'make_zero', outPath);
+        // -c copy ki jagah re-encode karo — keyframe alignment issue:
+        // -c copy sirf keyframe boundary pe cut karta hai, exact trimEnd pe nahi.
+        // Agar keyframe 4.0s pe hai aur trimEnd 5.8s hai, clip 4.0s pe cut hogi.
+        // Re-encode se exact frame-accurate trim hoti hai.
+        // -preset fast use kar rahe hain (slow nahi) — trim-only clip ke liye sufficient.
+        args.push(
+          '-c:v', 'libx264', '-preset', 'fast', '-crf', '17',
+          '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
+          outPath
+        );
         await run('ffmpeg', args);
       } else {
         fs.copyFileSync(inPath, outPath);
