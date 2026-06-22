@@ -288,7 +288,7 @@ app.get('/', (req, res) => {
 });
 
 app.post('/merge', (req, res) => {
-  const { clips, audio } = req.body || {};
+  const { clips } = req.body || {};
 
   if (!Array.isArray(clips) || clips.length === 0) {
     return res.status(400).json({ error: 'clips array required' });
@@ -296,8 +296,6 @@ app.post('/merge', (req, res) => {
   for (const c of clips) {
     if (!c.url) return res.status(400).json({ error: 'Har clip mein url chahiye' });
   }
-
-  const audioClips = Array.isArray(audio) ? audio.filter(a => a && a.url) : [];
 
   const jobId = uuidv4();
   setJob(jobId, {
@@ -309,7 +307,7 @@ app.post('/merge', (req, res) => {
 
   res.json({ jobId });
 
-  processJob(jobId, clips, audioClips).catch(err => {
+  processJob(jobId, clips).catch(err => {
     console.error(`[Job ${jobId}] FAILED:`, err.message);
     setJob(jobId, { status: 'error', error: err.message });
   });
