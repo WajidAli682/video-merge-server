@@ -1,8 +1,4 @@
 // server.js — video-merge-server
-// Job-based: POST /merge -> jobId turant milta hai, background mein process hota hai,
-// GET /status/:jobId se poll karo jab tak status 'done' na ho.
-// ─────────────────────────────────────────────────────────────────────────────
-
 const express = require('express');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
@@ -17,17 +13,14 @@ app.use(express.json({ limit: '10mb' }));
 const STORAGE_DIR = path.join(__dirname, 'storage');
 if (!fs.existsSync(STORAGE_DIR)) fs.mkdirSync(STORAGE_DIR, { recursive: true });
 
-// Final merged videos yahan se serve hote hain: /files/<jobId>/final.mp4
 app.use('/files', express.static(STORAGE_DIR));
 
-// ── In-memory job store ─────────────────────────────────────────────────────
-const jobs = {}; // jobId -> { status, progress, total, downloadUrl, error, createdAt }
+const jobs = {};
 
 function setJob(jobId, patch) {
   jobs[jobId] = { ...(jobs[jobId] || {}), ...patch };
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
 function run(cmd, args) {
   return new Promise((resolve, reject) => {
     const proc = spawn(cmd, args);
@@ -38,10 +31,8 @@ function run(cmd, args) {
       if (code === 0) {
         resolve();
       } else if (signal) {
-        // code null + signal set = process ko OS ne kill kiya — Railway pe
-        // ye almost hamesha OOM (memory limit) ki wajah se hota hai.
         const hint = signal === 'SIGKILL'
-          ? ' (signal SIGKILL — server memory limit se zyada use ho gayi, isliye process kill hua. Railway plan ka RAM badhao ya ffmpeg ka resource usage kam karo.)'
+          ? ' (signal SIGKILL — server memory limit se zyada use ho gayi)'
           : '';
         reject(new Error(`${cmd} killed by signal ${signal}${hint}: ${stderr.slice(-1500)}`));
       } else {
@@ -58,7 +49,6 @@ async function downloadFile(url, destPath) {
   fs.writeFileSync(destPath, Buffer.from(arrayBuf));
 }
 
-// ffprobe se clip ka width/height/fps/codec nikalo (JSON output)
 function probeClip(filePath) {
   return new Promise((resolve, reject) => {
     const args = [
@@ -75,26 +65,14 @@ function probeClip(filePath) {
     proc.stderr.on('data', d => { stderr += d.toString(); });
     proc.on('error', reject);
     proc.on('close', (code) => {
-      if (code !== 0) {
-        reject(new Error(`ffprobe failed: ${stderr.slice(-500)}`));
-        return;
-      }
+      if (code !== 0) { reject(new Error(`ffprobe failed: ${stderr.slice(-500)}`)); return; }
       try {
         const data = JSON.parse(stdout);
         const stream = data.streams?.[0];
-        if (!stream) {
-          reject(new Error('ffprobe: no video stream found'));
-          return;
-        }
-        // r_frame_rate aata hai "25/1" jaisa string format mein, usko number mein convert karo
+        if (!stream) { reject(new Error('ffprobe: no video stream found')); return; }
         const [num, den] = (stream.r_frame_rate || '25/1').split('/').map(Number);
         const fps = den ? Math.round((num / den) * 100) / 100 : num;
-        resolve({
-          width: stream.width,
-          height: stream.height,
-          fps,
-          codec: stream.codec_name
-        });
+        resolve({ width: stream.width, height: stream.height, fps, codec: stream.codec_name });
       } catch (e) {
         reject(new Error(`ffprobe parse error: ${e.message}`));
       }
@@ -102,28 +80,49 @@ function probeClip(filePath) {
   });
 }
 
-// ── Core pipeline ────────────────────────────────────────────────────────────
-// (Target resolution/fps ab per-job dynamically decide hota hai — sabse
-// common format ko target banaya jata hai taake kam se kam clips re-encode hon)
+// Video file ki exact duration nikalo (seconds mein)
+function probeDuration(filePath) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-v', 'error',
+      '-show_entries', 'format=duration',
+      '-of', 'json',
+      filePath
+    ];
+    const proc = spawn('ffprobe', args);
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', d => { stdout += d.toString(); });
+    proc.stderr.on('data', d => { stderr += d.toString(); });
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      if (code !== 0) { reject(new Error(`ffprobe duration failed: ${stderr.slice(-300)}`)); return; }
+      try {
+        const data = JSON.parse(stdout);
+        resolve(parseFloat(data.format?.duration || '0'));
+      } catch (e) {
+        reject(new Error(`ffprobe duration parse error: ${e.message}`));
+      }
+    });
+  });
+}
 
 async function processJob(jobId, clips, audioClips) {
   const jobDir = path.join(STORAGE_DIR, jobId);
   fs.mkdirSync(jobDir, { recursive: true });
 
-  // Step 1 — Download all clips (strictly sequential — order preserve karna zaroori hai)
+  // Step 1 — Download all clips
   setJob(jobId, { status: 'downloading', progress: 0 });
-  console.log(`[Job ${jobId}] Clips received in order:`, clips.map((c,i) => `${i+1}:${c.type}`).join(', '));
+  console.log(`[Job ${jobId}] Clips received:`, clips.map((c,i) => `${i+1}:${c.type}`).join(', '));
   const rawPaths = [];
   for (let i = 0; i < clips.length; i++) {
     const rawPath = path.join(jobDir, `raw_${i}.mp4`);
     await downloadFile(clips[i].url, rawPath);
     rawPaths.push(rawPath);
-    setJob(jobId, { progress: Math.round(((i + 1) / clips.length) * 20) }); // 0-20%
+    setJob(jobId, { progress: Math.round(((i + 1) / clips.length) * 20) });
   }
 
-  // Step 2 — Har clip ka asal resolution/fps/codec probe karo (ffprobe se),
-  // taake pata chale konsi clips already same format mein hain — unhe
-  // re-encode karne ki zaroorat nahi, sirf jo alag hain unhi ko normalize karo.
+  // Step 2 — Probe clips
   setJob(jobId, { status: 'analyzing', progress: 22 });
   const probes = [];
   for (let i = 0; i < rawPaths.length; i++) {
@@ -131,13 +130,11 @@ async function processJob(jobId, clips, audioClips) {
       const info = await probeClip(rawPaths[i]);
       probes.push(info);
     } catch (e) {
-      console.warn(`[Job ${jobId}] Probe failed for clip ${i}, will normalize as fallback:`, e.message);
-      probes.push(null); // null = unknown, force normalize
+      console.warn(`[Job ${jobId}] Probe failed for clip ${i}:`, e.message);
+      probes.push(null);
     }
   }
 
-  // Sabse common resolution/fps dhundo (jo zyada clips mein match karta hai)
-  // — usi ko target bana lo, taake kam se kam clips ko touch karna pade.
   const validProbes = probes.filter(p => p !== null);
   const counts = {};
   validProbes.forEach(p => {
@@ -152,19 +149,17 @@ async function processJob(jobId, clips, audioClips) {
 
   let TARGET_W, TARGET_H, TARGET_FPS;
   if (targetKey) {
-    const [res, codec] = targetKey.split('|');
+    const [res] = targetKey.split('|');
     const [wh, fps] = res.split('@');
     [TARGET_W, TARGET_H] = wh.split('x').map(Number);
     TARGET_FPS = Number(fps);
   } else {
-    // Koi clip probe nahi ho saki — safe default
     TARGET_W = 1920; TARGET_H = 1080; TARGET_FPS = 30;
   }
 
   console.log(`[Job ${jobId}] Target format: ${TARGET_W}x${TARGET_H}@${TARGET_FPS} (${maxCount}/${clips.length} clips already match)`);
 
-  // Step 3 — Trim (agar zaroori ho) + sirf jo clips target se mismatch hain unhi ko normalize karo.
-  // Matching clips ko bas trim karo (-c copy se, fast aur lossless) ya as-is rakho.
+  // Step 3 — Normalize/trim clips
   setJob(jobId, { status: 'processing', progress: 25 });
   const normPaths = [];
   for (let i = 0; i < clips.length; i++) {
@@ -184,21 +179,13 @@ async function processJob(jobId, clips, audioClips) {
     if (needsTrim) args.push('-t', String(clip.trimEnd));
 
     if (matchesTarget) {
-      // Already sahi format mein — bas trim karo (ya copy), re-encode mat karo.
-      // Yahi step quality 100% original rakhta hai jahan possible ho.
       if (needsTrim) {
         args.push('-c', 'copy', '-avoid_negative_ts', 'make_zero', outPath);
+        await run('ffmpeg', args);
       } else {
-        // Trim bhi nahi chahiye aur format bhi match — seedha copy
         fs.copyFileSync(inPath, outPath);
-        normPaths.push(outPath);
-        setJob(jobId, { progress: 25 + Math.round(((i + 1) / clips.length) * 55) });
-        continue;
       }
     } else {
-      // increase + crop: clip ko itna scale karo ke target ko POORA bhar de
-      // (chhota side match), phir extra hissa center se crop kar do.
-      // Isse black bars nahi aate — bas thoda zoom-in effect hota hai.
       args.push(
         '-vf', `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase,crop=${TARGET_W}:${TARGET_H},setsar=1,fps=${TARGET_FPS}`,
         '-c:v', 'libx264', '-preset', 'slow', '-crf', '17',
@@ -206,37 +193,31 @@ async function processJob(jobId, clips, audioClips) {
         '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
         outPath
       );
+      await run('ffmpeg', args);
     }
-
-    await run('ffmpeg', args);
     normPaths.push(outPath);
-    setJob(jobId, { progress: 25 + Math.round(((i + 1) / clips.length) * 55) }); // 25-80%
+    setJob(jobId, { progress: 25 + Math.round(((i + 1) / clips.length) * 55) });
   }
 
-  // Step 3 — Audio: saari TTS audio files concat karke ek master audio banao,
-  // phir poori merged video pe overlay karo.
-  // Avatar clips ka apna audio already hai — lekin master TTS overlay se
-  // replace ho jayega. Ye theek hai kyunki TTS aur avatar audio same content
-  // hai (avatar wahi bol raha hai jo TTS mein hai), aur TTS quality consistent hai.
+  // Step 4 — Concat all clips (video only, strip audio)
   setJob(jobId, { status: 'audio', progress: 80 });
+  const listFile = path.join(jobDir, 'concat_list.txt');
+  const listContent = normPaths.map(p => `file '${p.replace(/'/g, "'\\''")}'`).join('\n');
+  fs.writeFileSync(listFile, listContent);
 
+  const videoOnlyPath = path.join(jobDir, 'video_only.mp4');
+  // -an = audio strip — video only concat, taake embedded avatar audio interference na kare
+  await run('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listFile, '-c:v', 'copy', '-an', videoOnlyPath]);
+
+  let finalPath = videoOnlyPath;
+
+  // Step 5 — Audio overlay
   console.log(`[Job ${jobId}] audioClips received: ${audioClips?.length || 0}`);
 
-  let finalPath = path.join(jobDir, 'video_only.mp4');
-
-  // Pehle sab clips concat karo (video only step)
-  const listFile = path.join(jobDir, 'concat_list.txt');
-  const listContent = normPaths
-    .map(p => `file '${p.replace(/'/g, "'\\''")}'`)
-    .join('\n');
-  fs.writeFileSync(listFile, listContent);
-  await run('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listFile, '-c', 'copy', finalPath]);
-
-  // Audio overlay agar audioClips hain
   if (Array.isArray(audioClips) && audioClips.length > 0) {
     setJob(jobId, { status: 'audio', progress: 85 });
 
-    // Saari audio files download karo
+    // Download audio files
     const audioRawPaths = [];
     for (let i = 0; i < audioClips.length; i++) {
       const audioPath = path.join(jobDir, `audio_${i}.wav`);
@@ -251,51 +232,70 @@ async function processJob(jobId, clips, audioClips) {
     }
 
     if (audioRawPaths.length > 0) {
-      // Sab audio concat karo
+      // Concat audio
       const audioListFile = path.join(jobDir, 'audio_list.txt');
       fs.writeFileSync(audioListFile, audioRawPaths.map(p => `file '${p.replace(/'/g, "'\\''")}'`).join('\n'));
       const masterAudioPath = path.join(jobDir, 'master_audio.aac');
-      await run('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', audioListFile, '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2', masterAudioPath]);
+      await run('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', audioListFile,
+        '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2', masterAudioPath]);
 
-      // Master audio ko video pe overlay karo
+      // Video ki exact duration nikalo — is duration tak audio overlay karo
+      // (-shortest use nahi karna: agar audio thoda lambi ho to video pe clip hogi,
+      //  agar thodi chhoti ho to end mein silence — dono cases mein sync safe hai)
+      const videoDuration = await probeDuration(videoOnlyPath);
+      console.log(`[Job ${jobId}] Video duration: ${videoDuration.toFixed(3)}s`);
+
+      // Audio ko video duration tak exactly trim/pad karo
+      const audioFixedPath = path.join(jobDir, 'master_audio_fixed.aac');
+      await run('ffmpeg', ['-y', '-i', masterAudioPath,
+        '-t', String(videoDuration),   // exactly video ki duration tak — na zyada, na kam
+        '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
+        audioFixedPath]);
+
+      // Overlay — no -shortest, explicit -t se control
       const withAudioPath = path.join(jobDir, 'final.mp4');
-      await run('ffmpeg', ['-y', '-i', finalPath, '-i', masterAudioPath, '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-shortest', withAudioPath]);
+      await run('ffmpeg', ['-y',
+        '-i', videoOnlyPath,
+        '-i', audioFixedPath,
+        '-map', '0:v:0',
+        '-map', '1:a:0',
+        '-c:v', 'copy',
+        '-c:a', 'aac', '-b:a', '192k',
+        '-t', String(videoDuration),   // output exactly video duration tak
+        withAudioPath]);
 
       finalPath = withAudioPath;
 
-      // Cleanup audio intermediates
-      for (const p of [...audioRawPaths, audioListFile, masterAudioPath]) {
+      // Cleanup
+      for (const p of [...audioRawPaths, audioListFile, masterAudioPath, audioFixedPath, videoOnlyPath]) {
         try { fs.unlinkSync(p); } catch (_) {}
       }
-      console.log(`[Job ${jobId}] Master audio overlay complete`);
+      console.log(`[Job ${jobId}] Audio overlay complete — final duration: ${videoDuration.toFixed(3)}s`);
+    } else {
+      // Koi audio download nahi ho saka
+      const fp = path.join(jobDir, 'final.mp4');
+      fs.renameSync(videoOnlyPath, fp);
+      finalPath = fp;
     }
   } else {
-    console.log(`[Job ${jobId}] No audioClips — video without audio overlay`);
-    // Rename video_only to final
-    fs.renameSync(finalPath, path.join(jobDir, 'final.mp4'));
-    finalPath = path.join(jobDir, 'final.mp4');
+    // No audioClips — video as-is
+    const fp = path.join(jobDir, 'final.mp4');
+    fs.renameSync(videoOnlyPath, fp);
+    finalPath = fp;
   }
 
-  // Cleanup intermediate files
+  // Cleanup intermediates
   for (const p of [...rawPaths, ...normPaths, listFile]) {
     try { fs.unlinkSync(p); } catch (_) {}
   }
 
-  setJob(jobId, {
-    status: 'done',
-    progress: 100,
-    downloadUrl: `/files/${jobId}/final.mp4`
-  });
+  setJob(jobId, { status: 'done', progress: 100, downloadUrl: `/files/${jobId}/final.mp4` });
 }
 
-// ── Routes ───────────────────────────────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({ ok: true, service: 'video-merge-server' });
-});
+app.get('/', (req, res) => res.json({ ok: true, service: 'video-merge-server' }));
 
 app.post('/merge', (req, res) => {
   const { clips, audio } = req.body || {};
-
   if (!Array.isArray(clips) || clips.length === 0) {
     return res.status(400).json({ error: 'clips array required' });
   }
@@ -304,15 +304,8 @@ app.post('/merge', (req, res) => {
   }
 
   const audioClips = Array.isArray(audio) ? audio.filter(a => a && a.url) : [];
-
   const jobId = uuidv4();
-  setJob(jobId, {
-    status: 'queued',
-    progress: 0,
-    total: clips.length,
-    createdAt: Date.now()
-  });
-
+  setJob(jobId, { status: 'queued', progress: 0, total: clips.length, createdAt: Date.now() });
   res.json({ jobId });
 
   processJob(jobId, clips, audioClips).catch(err => {
@@ -327,9 +320,7 @@ app.get('/status/:jobId', (req, res) => {
   res.json(job);
 });
 
-// ── Old job cleanup (disk space bachane ke liye) ───────────────────────────
-const MAX_JOB_AGE_MS = 2 * 60 * 60 * 1000; // 2 hours
-
+const MAX_JOB_AGE_MS = 2 * 60 * 60 * 1000;
 function cleanupOldJobs() {
   const now = Date.now();
   for (const jobId of Object.keys(jobs)) {
@@ -342,10 +333,7 @@ function cleanupOldJobs() {
     }
   }
 }
-setInterval(cleanupOldJobs, 30 * 60 * 1000); // har 30 min check karo
+setInterval(cleanupOldJobs, 30 * 60 * 1000);
 
-// ── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`video-merge-server listening on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`video-merge-server listening on port ${PORT}`));
