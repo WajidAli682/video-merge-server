@@ -204,9 +204,30 @@ async function processJob(jobId, clips, audioClips) {
       );
       await run('ffmpeg', args);
     }
-    // Per-clip log — trim decision track karo
+    // Per-clip log + loop-extend agar clip trimEnd se chhoti ho
     const actualDur = await probeDuration(outPath).catch(() => null);
     console.log(`[Job ${jobId}] Clip ${i+1}/${clips.length}: type=${clip.type} matchesTarget=${!!matchesTarget} needsTrim=${needsTrim} trimEnd=${clip.trimEnd?.toFixed(3) ?? 'null'} actualDur=${actualDur?.toFixed(3) ?? 'err'}`);
+
+    // Agar clip ki actual duration trimEnd se chhoti hai — loop karke extend karo
+    // (HeyGen editor mein kuch footage clips repeat/loop ho ke longer duration fill karti hain)
+    if (needsTrim && actualDur !== null && clip.trimEnd && actualDur < clip.trimEnd - 0.1) {
+      console.log(`[Job ${jobId}] Clip ${i+1}: chhoti hai (${actualDur?.toFixed(3)}s < ${clip.trimEnd.toFixed(3)}s) — loop extend kar rahe hain`);
+      const loopedPath = path.join(jobDir, `looped_${i}.mp4`);
+      await run('ffmpeg', [
+        '-y',
+        '-stream_loop', '-1',   // infinite loop
+        '-i', outPath,
+        '-t', String(clip.trimEnd),  // exactly trimEnd tak cut
+        '-c:v', 'libx264', '-preset', 'fast', '-crf', '17',
+        '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
+        loopedPath
+      ]);
+      try { fs.unlinkSync(outPath); } catch (_) {}
+      fs.renameSync(loopedPath, outPath);
+      const newDur = await probeDuration(outPath).catch(() => null);
+      console.log(`[Job ${jobId}] Clip ${i+1}: loop extend done — newDur=${newDur?.toFixed(3)}s`);
+    }
+
     normPaths.push(outPath);
     setJob(jobId, { progress: 25 + Math.round(((i + 1) / clips.length) * 55) });
   }
