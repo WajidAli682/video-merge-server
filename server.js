@@ -176,7 +176,11 @@ async function processJob(jobId, clips, audioClips) {
       probe.codec === 'h264';
 
     const args = ['-y', '-i', inPath];
-    if (needsTrim) args.push('-t', String(clip.trimEnd));
+    // trimEnd available ho to hamesha -t lagao — chahe trimNeeded true/false ho.
+    // Agar clip already chhoti hai (extend case), loop-extend baad mein handle karega.
+    // Agar clip lambi hai aur trimNeeded=false set hua (extension ne galat calculate kiya),
+    // tab bhi trimEnd se cut ho jayegi.
+    if (clip.trimEnd) args.push('-t', String(clip.trimEnd));
 
     if (matchesTarget) {
       if (needsTrim) {
@@ -208,9 +212,12 @@ async function processJob(jobId, clips, audioClips) {
     const actualDur = await probeDuration(outPath).catch(() => null);
     console.log(`[Job ${jobId}] Clip ${i+1}/${clips.length}: type=${clip.type} matchesTarget=${!!matchesTarget} needsTrim=${needsTrim} trimEnd=${clip.trimEnd?.toFixed(3) ?? 'null'} actualDur=${actualDur?.toFixed(3) ?? 'err'}`);
 
-    // Agar clip ki actual duration trimEnd se chhoti hai — loop karke extend karo
+    // Agar clip ki actual duration trimEnd se alag hai — fix karo:
+    // Case 1: actualDur > trimEnd — trim karo (already handled upar, but double-check)
+    // Case 2: actualDur < trimEnd — loop extend karo
     // (HeyGen editor mein kuch footage clips repeat/loop ho ke longer duration fill karti hain)
-    if (needsTrim && actualDur !== null && clip.trimEnd && actualDur < clip.trimEnd - 0.1) {
+    // Note: needsTrim check nahi karte — trimEnd available hona kaafi hai
+    if (clip.trimEnd && actualDur !== null && actualDur < clip.trimEnd - 0.1) {
       console.log(`[Job ${jobId}] Clip ${i+1}: chhoti hai (${actualDur?.toFixed(3)}s < ${clip.trimEnd.toFixed(3)}s) — loop extend kar rahe hain`);
       const loopedPath = path.join(jobDir, `looped_${i}.mp4`);
       await run('ffmpeg', [
