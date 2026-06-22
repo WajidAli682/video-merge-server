@@ -110,8 +110,9 @@ async function processJob(jobId, clips, audioClips) {
   const jobDir = path.join(STORAGE_DIR, jobId);
   fs.mkdirSync(jobDir, { recursive: true });
 
-  // Step 1 — Download all clips
+  // Step 1 — Download all clips (strictly sequential — order preserve karna zaroori hai)
   setJob(jobId, { status: 'downloading', progress: 0 });
+  console.log(`[Job ${jobId}] Clips received in order:`, clips.map((c,i) => `${i+1}:${c.type}`).join(', '));
   const rawPaths = [];
   for (let i = 0; i < clips.length; i++) {
     const rawPath = path.join(jobDir, `raw_${i}.mp4`);
