@@ -213,50 +213,62 @@ async function processJob(jobId, clips, audioClips) {
     setJob(jobId, { progress: 25 + Math.round(((i + 1) / clips.length) * 55) }); // 25-80%
   }
 
-  // Step 3 — Har clip ke liye audio fix karo:
-  // Avatar clips → apna embedded audio rakho (bilkul touch mat karo)
-  // Footage clips → mute hoti hain, unpe TTS audio overlay karo
+  // Step 3 — Har clip ke liye audio fix karo
   setJob(jobId, { status: 'audio', progress: 80 });
   const audioPaths = [];
+
+  // Pehle check karo audioClips kitne hain
+  console.log(`[Job ${jobId}] audioClips received: ${audioClips?.length || 0}`);
+  console.log(`[Job ${jobId}] clips with ttsUrl: ${clips.filter(c => c.ttsUrl).length}`);
+  console.log(`[Job ${jobId}] clips with ownAudio=false: ${clips.filter(c => c.ownAudio === false).length}`);
 
   for (let i = 0; i < clips.length; i++) {
     const clip = clips[i];
     const inPath = normPaths[i];
     const outPath = path.join(jobDir, `audio_fixed_${i}.mp4`);
 
+    console.log(`[Job ${jobId}] Clip ${i + 1}: type=${clip.type}, ownAudio=${clip.ownAudio}, hasTtsUrl=${!!clip.ttsUrl}`);
+
     if (clip.ownAudio !== false) {
-      // Avatar clip — apna audio already sahi hai, copy karo as-is
       fs.copyFileSync(inPath, outPath);
       audioPaths.push(outPath);
       console.log(`[Job ${jobId}] Clip ${i + 1}: avatar — own audio kept`);
     } else if (clip.ttsUrl) {
-      // Footage clip — TTS audio download karke is clip pe overlay karo
       const ttsPath = path.join(jobDir, `tts_${i}.wav`);
-      await downloadFile(clip.ttsUrl, ttsPath);
+      try {
+        console.log(`[Job ${jobId}] Clip ${i + 1}: downloading TTS from ${clip.ttsUrl.substring(0, 80)}`);
+        await downloadFile(clip.ttsUrl, ttsPath);
+        const ttsSize = fs.statSync(ttsPath).size;
+        console.log(`[Job ${jobId}] Clip ${i + 1}: TTS downloaded, size=${ttsSize} bytes`);
 
-      await run('ffmpeg', [
-        '-y',
-        '-i', inPath,
-        '-i', ttsPath,
-        '-map', '0:v:0',
-        '-map', '1:a:0',
-        '-c:v', 'copy',
-        '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
-        '-shortest',
-        outPath
-      ]);
+        await run('ffmpeg', [
+          '-y',
+          '-i', inPath,
+          '-i', ttsPath,
+          '-map', '0:v:0',
+          '-map', '1:a:0',
+          '-c:v', 'copy',
+          '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
+          '-shortest',
+          outPath
+        ]);
 
-      try { fs.unlinkSync(ttsPath); } catch (_) {}
-      audioPaths.push(outPath);
-      console.log(`[Job ${jobId}] Clip ${i + 1}: footage — TTS audio overlaid`);
+        try { fs.unlinkSync(ttsPath); } catch (_) {}
+        audioPaths.push(outPath);
+        console.log(`[Job ${jobId}] Clip ${i + 1}: footage — TTS audio overlaid OK`);
+      } catch (err) {
+        console.error(`[Job ${jobId}] Clip ${i + 1}: TTS FAILED — ${err.message}`);
+        // Fallback: mute clip as-is
+        fs.copyFileSync(inPath, outPath);
+        audioPaths.push(outPath);
+      }
     } else {
-      // Na ownAudio na ttsUrl — as-is copy karo (silent rahega)
       fs.copyFileSync(inPath, outPath);
       audioPaths.push(outPath);
-      console.log(`[Job ${jobId}] Clip ${i + 1}: no audio info — kept as-is`);
+      console.log(`[Job ${jobId}] Clip ${i + 1}: no ttsUrl — kept as-is (silent)`);
     }
 
-    setJob(jobId, { progress: 80 + Math.round(((i + 1) / clips.length) * 10) }); // 80-90%
+    setJob(jobId, { progress: 80 + Math.round(((i + 1) / clips.length) * 10) });
   }
 
   // Step 4 — Concat (ab har clip ka audio sahi hai)
