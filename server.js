@@ -213,77 +213,71 @@ async function processJob(jobId, clips, audioClips) {
     setJob(jobId, { progress: 25 + Math.round(((i + 1) / clips.length) * 55) }); // 25-80%
   }
 
-  // Step 3 — Har clip ke liye audio fix karo
+  // Step 3 — Audio: saari TTS audio files concat karke ek master audio banao,
+  // phir poori merged video pe overlay karo.
+  // Avatar clips ka apna audio already hai — lekin master TTS overlay se
+  // replace ho jayega. Ye theek hai kyunki TTS aur avatar audio same content
+  // hai (avatar wahi bol raha hai jo TTS mein hai), aur TTS quality consistent hai.
   setJob(jobId, { status: 'audio', progress: 80 });
-  const audioPaths = [];
 
-  // Pehle check karo audioClips kitne hain
   console.log(`[Job ${jobId}] audioClips received: ${audioClips?.length || 0}`);
-  console.log(`[Job ${jobId}] clips with ttsUrl: ${clips.filter(c => c.ttsUrl).length}`);
-  console.log(`[Job ${jobId}] clips with ownAudio=false: ${clips.filter(c => c.ownAudio === false).length}`);
 
-  for (let i = 0; i < clips.length; i++) {
-    const clip = clips[i];
-    const inPath = normPaths[i];
-    const outPath = path.join(jobDir, `audio_fixed_${i}.mp4`);
+  let finalPath = path.join(jobDir, 'video_only.mp4');
 
-    console.log(`[Job ${jobId}] Clip ${i + 1}: type=${clip.type}, ownAudio=${clip.ownAudio}, hasTtsUrl=${!!clip.ttsUrl}`);
-
-    if (clip.ownAudio !== false) {
-      fs.copyFileSync(inPath, outPath);
-      audioPaths.push(outPath);
-      console.log(`[Job ${jobId}] Clip ${i + 1}: avatar — own audio kept`);
-    } else if (clip.ttsUrl) {
-      const ttsPath = path.join(jobDir, `tts_${i}.wav`);
-      try {
-        console.log(`[Job ${jobId}] Clip ${i + 1}: downloading TTS from ${clip.ttsUrl.substring(0, 80)}`);
-        await downloadFile(clip.ttsUrl, ttsPath);
-        const ttsSize = fs.statSync(ttsPath).size;
-        console.log(`[Job ${jobId}] Clip ${i + 1}: TTS downloaded, size=${ttsSize} bytes`);
-
-        await run('ffmpeg', [
-          '-y',
-          '-i', inPath,
-          '-i', ttsPath,
-          '-map', '0:v:0',
-          '-map', '1:a:0',
-          '-c:v', 'copy',
-          '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
-          '-shortest',
-          outPath
-        ]);
-
-        try { fs.unlinkSync(ttsPath); } catch (_) {}
-        audioPaths.push(outPath);
-        console.log(`[Job ${jobId}] Clip ${i + 1}: footage — TTS audio overlaid OK`);
-      } catch (err) {
-        console.error(`[Job ${jobId}] Clip ${i + 1}: TTS FAILED — ${err.message}`);
-        // Fallback: mute clip as-is
-        fs.copyFileSync(inPath, outPath);
-        audioPaths.push(outPath);
-      }
-    } else {
-      fs.copyFileSync(inPath, outPath);
-      audioPaths.push(outPath);
-      console.log(`[Job ${jobId}] Clip ${i + 1}: no ttsUrl — kept as-is (silent)`);
-    }
-
-    setJob(jobId, { progress: 80 + Math.round(((i + 1) / clips.length) * 10) });
-  }
-
-  // Step 4 — Concat (ab har clip ka audio sahi hai)
-  setJob(jobId, { status: 'merging', progress: 90 });
+  // Pehle sab clips concat karo (video only step)
   const listFile = path.join(jobDir, 'concat_list.txt');
-  const listContent = audioPaths
+  const listContent = normPaths
     .map(p => `file '${p.replace(/'/g, "'\\''")}'`)
     .join('\n');
   fs.writeFileSync(listFile, listContent);
-
-  const finalPath = path.join(jobDir, 'final.mp4');
   await run('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listFile, '-c', 'copy', finalPath]);
 
+  // Audio overlay agar audioClips hain
+  if (Array.isArray(audioClips) && audioClips.length > 0) {
+    setJob(jobId, { status: 'audio', progress: 85 });
+
+    // Saari audio files download karo
+    const audioRawPaths = [];
+    for (let i = 0; i < audioClips.length; i++) {
+      const audioPath = path.join(jobDir, `audio_${i}.wav`);
+      try {
+        await downloadFile(audioClips[i].url, audioPath);
+        const size = fs.statSync(audioPath).size;
+        console.log(`[Job ${jobId}] Audio ${i + 1}/${audioClips.length}: downloaded ${size} bytes`);
+        audioRawPaths.push(audioPath);
+      } catch (err) {
+        console.error(`[Job ${jobId}] Audio ${i + 1} download FAILED: ${err.message}`);
+      }
+    }
+
+    if (audioRawPaths.length > 0) {
+      // Sab audio concat karo
+      const audioListFile = path.join(jobDir, 'audio_list.txt');
+      fs.writeFileSync(audioListFile, audioRawPaths.map(p => `file '${p.replace(/'/g, "'\\''")}'`).join('\n'));
+      const masterAudioPath = path.join(jobDir, 'master_audio.aac');
+      await run('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', audioListFile, '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2', masterAudioPath]);
+
+      // Master audio ko video pe overlay karo
+      const withAudioPath = path.join(jobDir, 'final.mp4');
+      await run('ffmpeg', ['-y', '-i', finalPath, '-i', masterAudioPath, '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-shortest', withAudioPath]);
+
+      finalPath = withAudioPath;
+
+      // Cleanup audio intermediates
+      for (const p of [...audioRawPaths, audioListFile, masterAudioPath]) {
+        try { fs.unlinkSync(p); } catch (_) {}
+      }
+      console.log(`[Job ${jobId}] Master audio overlay complete`);
+    }
+  } else {
+    console.log(`[Job ${jobId}] No audioClips — video without audio overlay`);
+    // Rename video_only to final
+    fs.renameSync(finalPath, path.join(jobDir, 'final.mp4'));
+    finalPath = path.join(jobDir, 'final.mp4');
+  }
+
   // Cleanup intermediate files
-  for (const p of [...rawPaths, ...normPaths, ...audioPaths, listFile]) {
+  for (const p of [...rawPaths, ...normPaths, listFile]) {
     try { fs.unlinkSync(p); } catch (_) {}
   }
 
