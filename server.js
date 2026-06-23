@@ -196,14 +196,20 @@ async function processJob(jobId, clips, audioClips) {
       const imgPath = path.join(jobDir, `img_${i}.jpg`);
       await downloadFile(clip.url, imgPath);
       // ffmpeg: image → looped video (sceneDuration seconds)
+      // Image → video: tune stillimage + ultrafast + keyframe interval minimize karo
+      // -tune stillimage: static content ke liye ffmpeg ka built-in optimization
+      // -g 1: har frame keyframe — loop/seek issues nahi hote, RAM bhi kam
       await run('ffmpeg', [
         '-y',
-        '-loop', '1',           // image ko loop karo
+        '-loop', '1',
+        '-framerate', String(TARGET_FPS),  // input framerate set karo
         '-i', imgPath,
-        '-t', String(imgDur),   // exactly sceneDuration tak
-        '-vf', `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${TARGET_FPS}`,
-        '-c:v', 'libx264', '-preset', 'fast', '-crf', '17',
-        '-an',   // image mein audio nahi hota
+        '-t', String(imgDur),
+        '-vf', `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2,setsar=1`,
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-crf', '28',
+        '-g', '1',        // har frame keyframe — static image ke liye perfect
+        '-threads', '1',
+        '-an',
         outPath
       ]);
       try { fs.unlinkSync(imgPath); } catch (_) {}
@@ -233,7 +239,7 @@ async function processJob(jobId, clips, audioClips) {
     } else {
       args.push(
         '-vf', `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase,crop=${TARGET_W}:${TARGET_H},setsar=1,fps=${TARGET_FPS}`,
-        '-c:v', 'libx264', '-preset', 'slow', '-crf', '17',
+        '-c:v', 'libx264', '-preset', 'medium', '-crf', '17',  // slow→medium: quality almost same, RAM ~40% kam
         '-threads', '2', '-x264-params', 'threads=2:lookahead_threads=1',
         '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
         outPath
