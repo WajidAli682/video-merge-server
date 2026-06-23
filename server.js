@@ -111,54 +111,26 @@ async function processJob(jobId, clips, audioClips) {
   const jobDir = path.join(STORAGE_DIR, jobId);
   fs.mkdirSync(jobDir, { recursive: true });
 
-  // Step 1 — Download all clips (parallel — 5 ek waqt mein)
-  // Sequential se ~3-4x faster. 5 concurrent limit: Railway pe network saturation avoid karo.
+  // Step 1 — Download all clips (sequential — order guaranteed)
   setJob(jobId, { status: 'downloading', progress: 0 });
   console.log(`[Job ${jobId}] Clips received:`, clips.map((c,i) => `${i+1}:${c.type}`).join(', '));
-
-  const DOWNLOAD_CONCURRENCY = 2; // 5 se kam kiya — Railway 512MB RAM limit ke liye
-  const rawPaths = new Array(clips.length).fill(null);
-  let downloadedCount = 0;
-
-  // Clips ko batches mein download karo — order preserve karne ke liye index-based
-  for (let batchStart = 0; batchStart < clips.length; batchStart += DOWNLOAD_CONCURRENCY) {
-    const batchEnd = Math.min(batchStart + DOWNLOAD_CONCURRENCY, clips.length);
-    const batchPromises = [];
-
-    for (let i = batchStart; i < batchEnd; i++) {
-      const rawPath = path.join(jobDir, `raw_${i}.mp4`);
-      batchPromises.push(
-        downloadFile(clips[i].url, rawPath)
-          .then(() => {
-            rawPaths[i] = rawPath; // index-based — order guaranteed
-            downloadedCount++;
-            setJob(jobId, { progress: Math.round((downloadedCount / clips.length) * 20) });
-            console.log(`[Job ${jobId}] Downloaded clip ${i+1}/${clips.length}`);
-          })
-          .catch(err => {
-            console.error(`[Job ${jobId}] Clip ${i+1} download FAILED: ${err.message}`);
-            rawPaths[i] = null; // mark as failed
-          })
-      );
+  const rawPathsFinal = [];
+  const clipsFinal = [];
+  for (let i = 0; i < clips.length; i++) {
+    const rawPath = path.join(jobDir, `raw_${i}.mp4`);
+    try {
+      await downloadFile(clips[i].url, rawPath);
+      rawPathsFinal.push(rawPath);
+      clipsFinal.push(clips[i]);
+    } catch (err) {
+      console.error(`[Job ${jobId}] Clip ${i+1} download FAILED: ${err.message}`);
     }
-
-    await Promise.all(batchPromises); // batch complete hone ka wait karo
+    setJob(jobId, { progress: Math.round(((i + 1) / clips.length) * 20) });
   }
-
-  // Failed downloads filter karo — koi bhi null hai to skip
-  const validRawPaths = rawPaths.filter((p, i) => {
-    if (!p) console.warn(`[Job ${jobId}] Clip ${i+1} skipped (download failed)`);
-    return !!p;
-  });
-  // clips array bhi sync karo (failed wale hata do)
-  const validClips = clips.filter((_, i) => !!rawPaths[i]);
-  console.log(`[Job ${jobId}] ${validRawPaths.length}/${clips.length} clips downloaded successfully`);
+  console.log(`[Job ${jobId}] ${rawPathsFinal.length}/${clips.length} clips downloaded successfully`);
 
   // Step 2 — Probe clips
   setJob(jobId, { status: 'analyzing', progress: 22 });
-  // validRawPaths aur validClips use karo (failed downloads removed)
-  const rawPathsFinal = validRawPaths;
-  const clipsFinal = validClips;
   const probes = [];
   for (let i = 0; i < rawPathsFinal.length; i++) {
     try {
