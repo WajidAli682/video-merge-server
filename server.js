@@ -317,6 +317,22 @@ async function processJob(jobId, clips, audioClips) {
     // tab bhi trimEnd se cut ho jayegi.
     if (clip.trimEnd) args.push('-t', String(clip.trimEnd));
 
+    // GSAP clip — decrease+pad use karo (crop nahi — content poora visible rahega)
+    // increase+crop nahi karna — GSAP animation ka content cut ho jata hai
+    if (clip._gsapLocalPath || clip.type === 'gsap') {
+      await run('ffmpeg', [
+        '-y', '-i', inPath,
+        '-vf', `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=${TARGET_FPS}`,
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+        '-an', outPath
+      ]);
+      console.log(`[Job ${jobId}] Clip ${i+1}: GSAP padded to ${TARGET_W}x${TARGET_H}`);
+      normPaths.push(outPath);
+      try { fs.unlinkSync(inPath); } catch (_) {}
+      setJob(jobId, { progress: 25 + Math.round(((i + 1) / clipsFinal.length) * 55) });
+      continue;
+    }
+
     // Image scene — static image ko video mein convert karo
     if (clip.type === 'image') {
       const imgDur = clip.trimEnd || clip.sceneDuration || 5;
