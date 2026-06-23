@@ -117,6 +117,11 @@ async function convertGsapToMp4(gsapUrl, duration, width, height, outputPath) {
     throw new Error('Puppeteer/Chromium not installed: ' + e.message);
   }
 
+  // GSAP animation hamesha 1080x1920 design hoti hai (metadata se)
+  // Render 1080x1920 mein karo, phir ffmpeg se target size pe scale karo
+  const RENDER_W = 1080;
+  const RENDER_H = 1920;
+
   const browser = await puppeteer.launch({
     args: [
       ...chromium.args,
@@ -125,7 +130,7 @@ async function convertGsapToMp4(gsapUrl, duration, width, height, outputPath) {
       '--disable-dev-shm-usage',
       '--single-process',
     ],
-    defaultViewport: { width, height },
+    defaultViewport: { width: RENDER_W, height: RENDER_H },
     executablePath: await chromium.executablePath(
       'https://github.com/Sparticuz/chromium/releases/download/v121.0.0/chromium-v121.0.0-pack.tar'
     ),
@@ -134,13 +139,13 @@ async function convertGsapToMp4(gsapUrl, duration, width, height, outputPath) {
 
   try {
     const page = await browser.newPage();
-    await page.setViewport({ width, height });
+    await page.setViewport({ width: RENDER_W, height: RENDER_H });
 
     const fps = 25;
     const totalFrames = Math.ceil(duration * fps);
 
     const html = `<!DOCTYPE html><html><head><meta charset="UTF-8">
-<style>* { margin:0; padding:0; } body { width:${width}px; height:${height}px; overflow:hidden; background:#000; } #c { width:${width}px; height:${height}px; position:relative; }</style>
+<style>* { margin:0; padding:0; } body { width:${RENDER_W}px; height:${RENDER_H}px; overflow:hidden; background:#fff; } #c { width:${RENDER_W}px; height:${RENDER_H}px; position:relative; }</style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.2/gsap.min.js"></script>
 </head><body><div id="c"></div>
 <script type="module">
@@ -154,24 +159,25 @@ window.__ready = true;
     await page.setContent(html, { waitUntil: 'networkidle0', timeout: 30000 });
     await page.waitForFunction(() => window.__ready === true, { timeout: 15000 });
 
-    // Frame-by-frame screenshot capture
+    // Frame-by-frame screenshot at 1080x1920
     const frames = [];
     for (let f = 0; f < totalFrames; f++) {
       const t = f / fps;
       await page.evaluate((time) => { if(window.__anim) window.__anim.seek(time); }, t);
-      const shot = await page.screenshot({ type: 'jpeg', quality: 85 });
+      const shot = await page.screenshot({ type: 'jpeg', quality: 90 });
       frames.push(shot);
     }
     await browser.close();
-    console.log(`GSAP: ${frames.length} frames captured`);
+    console.log(`GSAP: ${frames.length} frames captured at ${RENDER_W}x${RENDER_H}`);
 
-    // Frames → MP4
+    // Frames → MP4 at 1080x1920, phir scale to target size
+    const tempPath = outputPath + '_temp.mp4';
     await new Promise((resolve, reject) => {
       const ffmpegProc = spawn('ffmpeg', [
         '-y', '-f', 'image2pipe', '-framerate', String(fps),
         '-i', 'pipe:0',
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-        '-pix_fmt', 'yuv420p', '-an', outputPath
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
+        '-pix_fmt', 'yuv420p', '-an', tempPath
       ]);
       let stderr = '';
       ffmpegProc.stderr.on('data', d => { stderr += d.toString(); });
@@ -185,7 +191,25 @@ window.__ready = true;
         ffmpegProc.stdin.end();
       })();
     });
-    console.log('GSAP → MP4 done:', outputPath);
+
+    // Scale 1080x1920 → target size (decrease+pad — poora content visible rahega)
+    await new Promise((resolve, reject) => {
+      const proc = spawn('ffmpeg', [
+        '-y', '-i', tempPath,
+        '-vf', `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=white,setsar=1`,
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
+        '-pix_fmt', 'yuv420p', '-an', outputPath
+      ]);
+      let stderr = '';
+      proc.stderr.on('data', d => { stderr += d.toString(); });
+      proc.on('close', (code) => {
+        if (code === 0) resolve();
+        else reject(new Error('ffmpeg scale: ' + stderr.slice(-300)));
+      });
+      proc.on('error', reject);
+    });
+    try { fs.unlinkSync(tempPath); } catch(_) {}
+    console.log(`GSAP → MP4 done: ${width}x${height}`, outputPath);
   } catch (e) {
     await browser.close().catch(() => {});
     throw e;
