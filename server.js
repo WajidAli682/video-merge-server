@@ -248,6 +248,8 @@ async function processJob(jobId, clips, audioClips) {
     }
 
     normPaths.push(outPath);
+    // Raw file turant delete karo — disk space bachao (100+ clips ke liye zaroori)
+    try { fs.unlinkSync(inPath); } catch (_) {}
     setJob(jobId, { progress: 25 + Math.round(((i + 1) / clips.length) * 55) });
   }
 
@@ -260,6 +262,9 @@ async function processJob(jobId, clips, audioClips) {
   const videoOnlyPath = path.join(jobDir, 'video_only.mp4');
   // -an = audio strip — video only concat, taake embedded avatar audio interference na kare
   await run('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listFile, '-c:v', 'copy', '-an', videoOnlyPath]);
+  // Norm files turant delete karo concat ke baad — disk space bachao
+  for (const p of normPaths) { try { fs.unlinkSync(p); } catch (_) {} }
+  fs.unlinkSync(listFile);
 
   let finalPath = videoOnlyPath;
 
@@ -336,10 +341,9 @@ async function processJob(jobId, clips, audioClips) {
     finalPath = fp;
   }
 
-  // Cleanup intermediates
-  for (const p of [...rawPaths, ...normPaths, listFile]) {
-    try { fs.unlinkSync(p); } catch (_) {}
-  }
+  // Cleanup intermediates — rawPaths aur normPaths already delete ho chuke hain per-clip
+  // Sirf listFile agar abhi bhi bacha ho (norm-delete ke baad already deleted hai)
+  try { fs.unlinkSync(listFile); } catch (_) {}
 
   setJob(jobId, { status: 'done', progress: 100, downloadUrl: `/files/${jobId}/final.mp4` });
 }
