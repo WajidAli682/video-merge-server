@@ -253,97 +253,73 @@ async function processJob(jobId, clips, audioClips) {
     setJob(jobId, { progress: 25 + Math.round(((i + 1) / clips.length) * 55) });
   }
 
-  // Step 4 — Concat all clips (video only, strip audio)
+  // Step 4 — Per-clip audio merge, phir final concat
+  // HeyGen ka approach: har clip ko uski apni audio ke saath merge karo,
+  // phir sab merged clips concat karo. Master overlay nahi — isliye drift zero.
   setJob(jobId, { status: 'audio', progress: 80 });
-  const listFile = path.join(jobDir, 'concat_list.txt');
-  const listContent = normPaths.map(p => `file '${p.replace(/'/g, "'\\''")}'`).join('\n');
-  fs.writeFileSync(listFile, listContent);
-
-  const videoOnlyPath = path.join(jobDir, 'video_only.mp4');
-  // -an = audio strip — video only concat, taake embedded avatar audio interference na kare
-  await run('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listFile, '-c:v', 'copy', '-an', videoOnlyPath]);
-  // Norm files turant delete karo concat ke baad — disk space bachao
-  for (const p of normPaths) { try { fs.unlinkSync(p); } catch (_) {} }
-  fs.unlinkSync(listFile);
-
-  let finalPath = videoOnlyPath;
-
-  // Step 5 — Audio overlay
   console.log(`[Job ${jobId}] audioClips received: ${audioClips?.length || 0}`);
 
-  if (Array.isArray(audioClips) && audioClips.length > 0) {
-    setJob(jobId, { status: 'audio', progress: 85 });
+  const mergedClipPaths = [];
 
-    // Download audio files
-    const audioRawPaths = [];
-    for (let i = 0; i < audioClips.length; i++) {
+  for (let i = 0; i < normPaths.length; i++) {
+    const normPath = normPaths[i];
+    const clip = clips[i];
+    const mergedPath = path.join(jobDir, `merged_${i}.mp4`);
+    const audioClip = Array.isArray(audioClips) ? audioClips[i] : null;
+
+    if (audioClip && audioClip.url) {
+      // Is clip ki audio download karo
       const audioPath = path.join(jobDir, `audio_${i}.wav`);
       try {
-        await downloadFile(audioClips[i].url, audioPath);
+        await downloadFile(audioClip.url, audioPath);
         const size = fs.statSync(audioPath).size;
-        console.log(`[Job ${jobId}] Audio ${i + 1}/${audioClips.length}: downloaded ${size} bytes`);
-        audioRawPaths.push(audioPath);
+        console.log(`[Job ${jobId}] Clip ${i+1}: audio downloaded ${size} bytes`);
+
+        // Video + audio merge — clip ki exact duration tak
+        const clipDur = clip.trimEnd || await probeDuration(normPath).catch(() => null);
+        await run('ffmpeg', [
+          '-y',
+          '-i', normPath,
+          '-i', audioPath,
+          '-map', '0:v:0',
+          '-map', '1:a:0',
+          '-c:v', 'copy',
+          '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
+          ...(clipDur ? ['-t', String(clipDur)] : []),
+          mergedPath
+        ]);
+        try { fs.unlinkSync(audioPath); } catch (_) {}
+        console.log(`[Job ${jobId}] Clip ${i+1}: video+audio merged (dur=${clipDur ? clipDur.toFixed(3) : 'full'}s)`);
       } catch (err) {
-        console.error(`[Job ${jobId}] Audio ${i + 1} download FAILED: ${err.message}`);
+        console.error(`[Job ${jobId}] Clip ${i+1} audio FAILED: ${err.message} — video only`);
+        fs.copyFileSync(normPath, mergedPath);
       }
-    }
-
-    if (audioRawPaths.length > 0) {
-      // Concat audio
-      const audioListFile = path.join(jobDir, 'audio_list.txt');
-      fs.writeFileSync(audioListFile, audioRawPaths.map(p => `file '${p.replace(/'/g, "'\\''")}'`).join('\n'));
-      const masterAudioPath = path.join(jobDir, 'master_audio.aac');
-      await run('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', audioListFile,
-        '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2', masterAudioPath]);
-
-      // Video ki exact duration nikalo — is duration tak audio overlay karo
-      // (-shortest use nahi karna: agar audio thoda lambi ho to video pe clip hogi,
-      //  agar thodi chhoti ho to end mein silence — dono cases mein sync safe hai)
-      const videoDuration = await probeDuration(videoOnlyPath);
-      console.log(`[Job ${jobId}] Video duration: ${videoDuration.toFixed(3)}s`);
-
-      // Audio ko video duration tak exactly trim/pad karo
-      const audioFixedPath = path.join(jobDir, 'master_audio_fixed.aac');
-      await run('ffmpeg', ['-y', '-i', masterAudioPath,
-        '-t', String(videoDuration),   // exactly video ki duration tak — na zyada, na kam
-        '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
-        audioFixedPath]);
-
-      // Overlay — no -shortest, explicit -t se control
-      const withAudioPath = path.join(jobDir, 'final.mp4');
-      await run('ffmpeg', ['-y',
-        '-i', videoOnlyPath,
-        '-i', audioFixedPath,
-        '-map', '0:v:0',
-        '-map', '1:a:0',
-        '-c:v', 'copy',
-        '-c:a', 'aac', '-b:a', '192k',
-        '-t', String(videoDuration),   // output exactly video duration tak
-        withAudioPath]);
-
-      finalPath = withAudioPath;
-
-      // Cleanup
-      for (const p of [...audioRawPaths, audioListFile, masterAudioPath, audioFixedPath, videoOnlyPath]) {
-        try { fs.unlinkSync(p); } catch (_) {}
-      }
-      console.log(`[Job ${jobId}] Audio overlay complete — final duration: ${videoDuration.toFixed(3)}s`);
     } else {
-      // Koi audio download nahi ho saka
-      const fp = path.join(jobDir, 'final.mp4');
-      fs.renameSync(videoOnlyPath, fp);
-      finalPath = fp;
+      // Avatar clip — apna audio already embedded hai — as-is copy
+      fs.copyFileSync(normPath, mergedPath);
+      console.log(`[Job ${jobId}] Clip ${i+1}: avatar own audio — copied as-is`);
     }
-  } else {
-    // No audioClips — video as-is
-    const fp = path.join(jobDir, 'final.mp4');
-    fs.renameSync(videoOnlyPath, fp);
-    finalPath = fp;
+
+    // Norm file turant cleanup
+    try { fs.unlinkSync(normPath); } catch (_) {}
+    mergedClipPaths.push(mergedPath);
+    setJob(jobId, { progress: 80 + Math.round(((i + 1) / normPaths.length) * 15) });
   }
 
-  // Cleanup intermediates — rawPaths aur normPaths already delete ho chuke hain per-clip
-  // Sirf listFile agar abhi bhi bacha ho (norm-delete ke baad already deleted hai)
+  // Final concat — sab merged clips ek saath
+  setJob(jobId, { status: 'audio', progress: 95 });
+  const listFile = path.join(jobDir, 'concat_list.txt');
+  fs.writeFileSync(listFile, mergedClipPaths.map(p => `file '${p.replace(/'/g, "'\''")}'`).join('\n'));
+
+  const finalPath = path.join(jobDir, 'final.mp4');
+  await run('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listFile, '-c', 'copy', finalPath]);
+
+  // Cleanup
+  for (const p of mergedClipPaths) { try { fs.unlinkSync(p); } catch (_) {} }
   try { fs.unlinkSync(listFile); } catch (_) {}
+
+  const finalDur = await probeDuration(finalPath).catch(() => null);
+  console.log(`[Job ${jobId}] Final concat done — duration: ${finalDur ? finalDur.toFixed(3) : 'unknown'}s`);
 
   setJob(jobId, { status: 'done', progress: 100, downloadUrl: `/files/${jobId}/final.mp4` });
 }
