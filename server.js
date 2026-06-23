@@ -217,6 +217,31 @@ async function processJob(jobId, clips, audioClips) {
     // tab bhi trimEnd se cut ho jayegi.
     if (clip.trimEnd) args.push('-t', String(clip.trimEnd));
 
+    // Image scene — static image ko video mein convert karo
+    if (clip.type === 'image') {
+      const imgDur = clip.trimEnd || clip.sceneDuration || 5;
+      // Image download karo (.jpg/.png/.webp)
+      const imgPath = path.join(jobDir, `img_${i}.jpg`);
+      await downloadFile(clip.url, imgPath);
+      // ffmpeg: image → looped video (sceneDuration seconds)
+      await run('ffmpeg', [
+        '-y',
+        '-loop', '1',           // image ko loop karo
+        '-i', imgPath,
+        '-t', String(imgDur),   // exactly sceneDuration tak
+        '-vf', `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${TARGET_FPS}`,
+        '-c:v', 'libx264', '-preset', 'fast', '-crf', '17',
+        '-an',   // image mein audio nahi hota
+        outPath
+      ]);
+      try { fs.unlinkSync(imgPath); } catch (_) {}
+      console.log(`[Job ${jobId}] Clip ${i+1}: image→video converted (dur=${imgDur.toFixed(3)}s)`);
+      normPaths.push(outPath);
+      try { fs.unlinkSync(inPath); } catch (_) {}
+      setJob(jobId, { progress: 25 + Math.round(((i + 1) / clipsFinal.length) * 55) });
+      continue; // baaki normalize logic skip karo
+    }
+
     if (matchesTarget) {
       if (needsTrim) {
         // -c copy ki jagah re-encode karo — keyframe alignment issue:
