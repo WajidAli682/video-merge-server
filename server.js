@@ -209,8 +209,25 @@ async function processJob(jobId, clips, audioClips) {
       if (clip.type !== 'gsap') continue;
       
       const gsapMp4Path = path.join(jobDir, `gsap_${i}.mp4`);
-      const w = clip.width || 720;
-      const h = clip.height || 1280;
+      // Non-gsap clips ka resolution probe karke actual target size nikalo
+      // Taake GSAP seedha sahi size mein render ho — koi scaling nahi
+      let w = clip.width || 720;
+      let h = clip.height || 1280;
+      const nonGsapClip = clips.find((c, idx) => idx !== i && c.type !== 'gsap' && c.url && !c.url.startsWith('file://'));
+      if (nonGsapClip) {
+        // Ek non-gsap clip temporarily download karke probe karo
+        const tempProbe = path.join(jobDir, `probe_temp_${i}.mp4`);
+        try {
+          await downloadFile(nonGsapClip.url, tempProbe);
+          const probeInfo = await probeClip(tempProbe);
+          if (probeInfo) { w = probeInfo.width; h = probeInfo.height; }
+          fs.unlinkSync(tempProbe);
+          console.log(`[Job ${jobId}] GSAP target size from probe: ${w}x${h}`);
+        } catch (e) {
+          console.warn(`[Job ${jobId}] Probe failed, using default size: ${w}x${h}`);
+          try { fs.unlinkSync(tempProbe); } catch(_) {}
+        }
+      }
       const dur = clip.trimEnd || clip.sceneDuration || 7;
       
       console.log(`[Job ${jobId}] GSAP clip ${i+1}: converting (${w}x${h}, ${dur}s)`);
