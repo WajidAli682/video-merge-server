@@ -111,23 +111,58 @@ async function processJob(jobId, clips, audioClips) {
   const jobDir = path.join(STORAGE_DIR, jobId);
   fs.mkdirSync(jobDir, { recursive: true });
 
-  // Step 1 — Download all clips
+  // Step 1 — Download all clips (parallel — 5 ek waqt mein)
+  // Sequential se ~3-4x faster. 5 concurrent limit: Railway pe network saturation avoid karo.
   setJob(jobId, { status: 'downloading', progress: 0 });
   console.log(`[Job ${jobId}] Clips received:`, clips.map((c,i) => `${i+1}:${c.type}`).join(', '));
-  const rawPaths = [];
-  for (let i = 0; i < clips.length; i++) {
-    const rawPath = path.join(jobDir, `raw_${i}.mp4`);
-    await downloadFile(clips[i].url, rawPath);
-    rawPaths.push(rawPath);
-    setJob(jobId, { progress: Math.round(((i + 1) / clips.length) * 20) });
+
+  const DOWNLOAD_CONCURRENCY = 5;
+  const rawPaths = new Array(clips.length).fill(null);
+  let downloadedCount = 0;
+
+  // Clips ko batches mein download karo — order preserve karne ke liye index-based
+  for (let batchStart = 0; batchStart < clips.length; batchStart += DOWNLOAD_CONCURRENCY) {
+    const batchEnd = Math.min(batchStart + DOWNLOAD_CONCURRENCY, clips.length);
+    const batchPromises = [];
+
+    for (let i = batchStart; i < batchEnd; i++) {
+      const rawPath = path.join(jobDir, `raw_${i}.mp4`);
+      batchPromises.push(
+        downloadFile(clips[i].url, rawPath)
+          .then(() => {
+            rawPaths[i] = rawPath; // index-based — order guaranteed
+            downloadedCount++;
+            setJob(jobId, { progress: Math.round((downloadedCount / clips.length) * 20) });
+            console.log(`[Job ${jobId}] Downloaded clip ${i+1}/${clips.length}`);
+          })
+          .catch(err => {
+            console.error(`[Job ${jobId}] Clip ${i+1} download FAILED: ${err.message}`);
+            rawPaths[i] = null; // mark as failed
+          })
+      );
+    }
+
+    await Promise.all(batchPromises); // batch complete hone ka wait karo
   }
+
+  // Failed downloads filter karo — koi bhi null hai to skip
+  const validRawPaths = rawPaths.filter((p, i) => {
+    if (!p) console.warn(`[Job ${jobId}] Clip ${i+1} skipped (download failed)`);
+    return !!p;
+  });
+  // clips array bhi sync karo (failed wale hata do)
+  const validClips = clips.filter((_, i) => !!rawPaths[i]);
+  console.log(`[Job ${jobId}] ${validRawPaths.length}/${clips.length} clips downloaded successfully`);
 
   // Step 2 — Probe clips
   setJob(jobId, { status: 'analyzing', progress: 22 });
+  // validRawPaths aur validClips use karo (failed downloads removed)
+  const rawPathsFinal = validRawPaths;
+  const clipsFinal = validClips;
   const probes = [];
-  for (let i = 0; i < rawPaths.length; i++) {
+  for (let i = 0; i < rawPathsFinal.length; i++) {
     try {
-      const info = await probeClip(rawPaths[i]);
+      const info = await probeClip(rawPathsFinal[i]);
       probes.push(info);
     } catch (e) {
       console.warn(`[Job ${jobId}] Probe failed for clip ${i}:`, e.message);
@@ -162,9 +197,9 @@ async function processJob(jobId, clips, audioClips) {
   // Step 3 — Normalize/trim clips
   setJob(jobId, { status: 'processing', progress: 25 });
   const normPaths = [];
-  for (let i = 0; i < clips.length; i++) {
-    const clip = clips[i];
-    const inPath = rawPaths[i];
+  for (let i = 0; i < clipsFinal.length; i++) {
+    const clip = clipsFinal[i];
+    const inPath = rawPathsFinal[i];
     const probe = probes[i];
     const outPath = path.join(jobDir, `norm_${i}.mp4`);
     const needsTrim = !!(clip.trimNeeded && clip.trimEnd);
@@ -250,7 +285,7 @@ async function processJob(jobId, clips, audioClips) {
     normPaths.push(outPath);
     // Raw file turant delete karo — disk space bachao (100+ clips ke liye zaroori)
     try { fs.unlinkSync(inPath); } catch (_) {}
-    setJob(jobId, { progress: 25 + Math.round(((i + 1) / clips.length) * 55) });
+    setJob(jobId, { progress: 25 + Math.round(((i + 1) / clipsFinal.length) * 55) });
   }
 
   // Step 4 — Per-clip audio merge, phir final concat
@@ -263,7 +298,7 @@ async function processJob(jobId, clips, audioClips) {
 
   for (let i = 0; i < normPaths.length; i++) {
     const normPath = normPaths[i];
-    const clip = clips[i];
+    const clip = clipsFinal[i];
     const mergedPath = path.join(jobDir, `merged_${i}.mp4`);
     const audioClip = Array.isArray(audioClips) ? audioClips[i] : null;
 
