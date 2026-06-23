@@ -116,7 +116,7 @@ async function processJob(jobId, clips, audioClips) {
   setJob(jobId, { status: 'downloading', progress: 0 });
   console.log(`[Job ${jobId}] Clips received:`, clips.map((c,i) => `${i+1}:${c.type}`).join(', '));
 
-  const DOWNLOAD_CONCURRENCY = 5;
+  const DOWNLOAD_CONCURRENCY = 3; // 5 se kam kiya — Railway 512MB RAM limit ke liye
   const rawPaths = new Array(clips.length).fill(null);
   let downloadedCount = 0;
 
