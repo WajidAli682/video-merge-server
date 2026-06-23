@@ -252,29 +252,22 @@ async function processJob(jobId, clips, audioClips) {
     if (clip.trimEnd && actualDur !== null && actualDur < clip.trimEnd - 0.1) {
       console.log(`[Job ${jobId}] Clip ${i+1}: chhoti hai (${actualDur?.toFixed(3)}s < ${clip.trimEnd.toFixed(3)}s) — loop extend kar rahe hain`);
       const loopedPath = path.join(jobDir, `looped_${i}.mp4`);
-      // Step A: loop extend — clip ko trimEnd se thoda zyada banao (buffer ke saath)
+      // Loop extend: ultrafast preset use karo — RAM bachaao (Railway 512MB limit)
+      // Quality yahan matter nahi karta — sirf duration extend kar rahe hain,
+      // asli quality encode baad mein norm step mein already ho chuki hai.
+      // Ek hi pass mein exact trimEnd tak cut karo — 2 pass ki zaroorat nahi.
       await run('ffmpeg', [
         '-y',
         '-stream_loop', '-1',
         '-i', outPath,
-        '-t', String(clip.trimEnd + 2),  // trimEnd + 2s buffer (exact trim baad mein)
-        '-c:v', 'libx264', '-preset', 'fast', '-crf', '17',
+        '-t', String(clip.trimEnd),  // seedha exact duration — no buffer needed
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '17',
+        '-threads', '1',  // single thread — RAM aur CPU dono bachao
         '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
         loopedPath
       ]);
       try { fs.unlinkSync(outPath); } catch (_) {}
-      // Step B: exact trim — looped file ko exact trimEnd pe cut karo
-      const exactPath = path.join(jobDir, `exact_${i}.mp4`);
-      await run('ffmpeg', [
-        '-y',
-        '-i', loopedPath,
-        '-t', String(clip.trimEnd),
-        '-c:v', 'libx264', '-preset', 'fast', '-crf', '17',
-        '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
-        exactPath
-      ]);
-      try { fs.unlinkSync(loopedPath); } catch (_) {}
-      fs.renameSync(exactPath, outPath);
+      fs.renameSync(loopedPath, outPath);
       const newDur = await probeDuration(outPath).catch(() => null);
       console.log(`[Job ${jobId}] Clip ${i+1}: loop extend done — newDur=${newDur?.toFixed(3)}s (target: ${clip.trimEnd.toFixed(3)}s)`);
     }
