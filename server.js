@@ -107,8 +107,130 @@ function probeDuration(filePath) {
   });
 }
 
+// GSAP → MP4 converter (Puppeteer + headless Chrome)
+async function convertGsapToMp4(gsapUrl, duration, width, height, outputPath) {
+  let chromium, puppeteer;
+  try {
+    chromium = require('@sparticuz/chromium-min');
+    puppeteer = require('puppeteer-core');
+  } catch (e) {
+    throw new Error('Puppeteer/Chromium not installed: ' + e.message);
+  }
+
+  const browser = await puppeteer.launch({
+    args: [
+      ...chromium.args,
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--single-process',
+    ],
+    defaultViewport: { width, height },
+    executablePath: await chromium.executablePath(
+      'https://github.com/Sparticuz/chromium/releases/download/v121.0.0/chromium-v121.0.0-pack.tar'
+    ),
+    headless: true,
+  });
+
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width, height });
+
+    const fps = 25;
+    const totalFrames = Math.ceil(duration * fps);
+
+    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>* { margin:0; padding:0; } body { width:${width}px; height:${height}px; overflow:hidden; background:#000; } #c { width:${width}px; height:${height}px; position:relative; }</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.2/gsap.min.js"></script>
+</head><body><div id="c"></div>
+<script type="module">
+import { createAnimation } from '${gsapUrl}';
+const anim = createAnimation(document.getElementById('c'));
+anim.seek(0);
+window.__anim = anim;
+window.__ready = true;
+</script></body></html>`;
+
+    await page.setContent(html, { waitUntil: 'networkidle0', timeout: 30000 });
+    await page.waitForFunction(() => window.__ready === true, { timeout: 15000 });
+
+    // Frame-by-frame screenshot capture
+    const frames = [];
+    for (let f = 0; f < totalFrames; f++) {
+      const t = f / fps;
+      await page.evaluate((time) => { if(window.__anim) window.__anim.seek(time); }, t);
+      const shot = await page.screenshot({ type: 'jpeg', quality: 85 });
+      frames.push(shot);
+    }
+    await browser.close();
+    console.log(`GSAP: ${frames.length} frames captured`);
+
+    // Frames → MP4
+    await new Promise((resolve, reject) => {
+      const ffmpegProc = spawn('ffmpeg', [
+        '-y', '-f', 'image2pipe', '-framerate', String(fps),
+        '-i', 'pipe:0',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+        '-pix_fmt', 'yuv420p', '-an', outputPath
+      ]);
+      let stderr = '';
+      ffmpegProc.stderr.on('data', d => { stderr += d.toString(); });
+      ffmpegProc.on('close', (code) => {
+        if (code === 0) resolve();
+        else reject(new Error('ffmpeg frames: ' + stderr.slice(-300)));
+      });
+      ffmpegProc.on('error', reject);
+      (async () => {
+        for (const frame of frames) { ffmpegProc.stdin.write(frame); }
+        ffmpegProc.stdin.end();
+      })();
+    });
+    console.log('GSAP → MP4 done:', outputPath);
+  } catch (e) {
+    await browser.close().catch(() => {});
+    throw e;
+  }
+}
+
 async function processJob(jobId, clips, audioClips) {
   const jobDir = path.join(STORAGE_DIR, jobId);
+  fs.mkdirSync(jobDir, { recursive: true });
+
+  // Step 0 — GSAP scenes pehle convert karo (Puppeteer)
+  // Sequential: pehle sab gsap → mp4, phir ffmpeg pipeline
+  // Isse RAM peak alag time pe hogi — crash nahi hoga
+  const gsapScenes = clips.filter(c => c.type === 'gsap');
+  if (gsapScenes.length > 0) {
+    setJob(jobId, { status: 'gsap', progress: 0 });
+    console.log(`[Job ${jobId}] GSAP scenes: ${gsapScenes.length} — converting pehle`);
+    
+    for (let i = 0; i < clips.length; i++) {
+      const clip = clips[i];
+      if (clip.type !== 'gsap') continue;
+      
+      const gsapMp4Path = path.join(jobDir, `gsap_${i}.mp4`);
+      const w = clip.width || 720;
+      const h = clip.height || 1280;
+      const dur = clip.trimEnd || clip.sceneDuration || 7;
+      
+      console.log(`[Job ${jobId}] GSAP clip ${i+1}: converting (${w}x${h}, ${dur}s)`);
+      try {
+        await convertGsapToMp4(clip.url, dur, w, h, gsapMp4Path);
+        // clip ka url replace karo converted mp4 se
+        clips[i] = { ...clip, url: `file://${gsapMp4Path}`, _gsapLocalPath: gsapMp4Path, type: 'video' };
+        console.log(`[Job ${jobId}] GSAP clip ${i+1}: done`);
+      } catch (err) {
+        console.error(`[Job ${jobId}] GSAP clip ${i+1} FAILED: ${err.message} — black placeholder use karenge`);
+        // Fallback: black video
+        const blackPath = path.join(jobDir, `black_${i}.mp4`);
+        await run('ffmpeg', ['-y', '-f', 'lavfi', '-i', `color=c=black:size=${w}x${h}:rate=25`, '-t', String(dur), '-c:v', 'libx264', '-preset', 'ultrafast', blackPath]);
+        clips[i] = { ...clip, url: `file://${blackPath}`, _gsapLocalPath: blackPath, type: 'video' };
+      }
+    }
+    console.log(`[Job ${jobId}] All GSAP scenes converted`);
+  }
+
+  // Ensure jobDir exists
   fs.mkdirSync(jobDir, { recursive: true });
 
   // Step 1 — Download all clips (sequential — order guaranteed)
@@ -119,7 +241,13 @@ async function processJob(jobId, clips, audioClips) {
   for (let i = 0; i < clips.length; i++) {
     const rawPath = path.join(jobDir, `raw_${i}.mp4`);
     try {
-      await downloadFile(clips[i].url, rawPath);
+      if (clips[i].url.startsWith('file://')) {
+        // GSAP converted file — already local, copy karo
+        const localPath = clips[i].url.replace('file://', '');
+        fs.copyFileSync(localPath, rawPath);
+      } else {
+        await downloadFile(clips[i].url, rawPath);
+      }
       rawPathsFinal.push(rawPath);
       clipsFinal.push(clips[i]);
     } catch (err) {
