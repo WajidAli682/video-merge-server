@@ -10,6 +10,8 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "uuid": "^9.0.1"
+    "uuid": "^9.0.1",
+    "puppeteer-core": "^21.11.0",
+    "@sparticuz/chromium-min": "^121.0.0"
   }
 }
