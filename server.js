@@ -159,38 +159,36 @@ window.__ready = true;
     await page.setContent(html, { waitUntil: 'networkidle0', timeout: 30000 });
     await page.waitForFunction(() => window.__ready === true, { timeout: 15000 });
 
-    // Frame-by-frame screenshot at 1080x1920
-    const frames = [];
+    // Frame-by-frame screenshot — disk pe save karo (RAM mein nahi)
+    // 24 GSAP clips × 300 frames × ~50KB = too much RAM if in-memory
+    const framesDir = outputPath + '_frames';
+    fs.mkdirSync(framesDir, { recursive: true });
+    let frameCount = 0;
+
     for (let f = 0; f < totalFrames; f++) {
       const t = f / fps;
       await page.evaluate((time) => { if(window.__anim) window.__anim.seek(time); }, t);
-      const shot = await page.screenshot({ type: 'jpeg', quality: 90 });
-      frames.push(shot);
+      const shot = await page.screenshot({ 
+        type: 'jpeg', 
+        quality: 85,
+        path: path.join(framesDir, `frame_${String(f).padStart(5, '0')}.jpg`)
+      });
+      frameCount++;
     }
     await browser.close();
-    console.log(`GSAP: ${frames.length} frames captured at ${RENDER_W}x${RENDER_H}`);
+    console.log(`GSAP: ${frameCount} frames saved to disk at ${RENDER_W}x${RENDER_H}`);
 
-    // Frames → MP4 at 1080x1920, phir scale to target size
+    // Frames (disk se) → MP4
     const tempPath = outputPath + '_temp.mp4';
-    await new Promise((resolve, reject) => {
-      const ffmpegProc = spawn('ffmpeg', [
-        '-y', '-f', 'image2pipe', '-framerate', String(fps),
-        '-i', 'pipe:0',
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
-        '-pix_fmt', 'yuv420p', '-an', tempPath
-      ]);
-      let stderr = '';
-      ffmpegProc.stderr.on('data', d => { stderr += d.toString(); });
-      ffmpegProc.on('close', (code) => {
-        if (code === 0) resolve();
-        else reject(new Error('ffmpeg frames: ' + stderr.slice(-300)));
-      });
-      ffmpegProc.on('error', reject);
-      (async () => {
-        for (const frame of frames) { ffmpegProc.stdin.write(frame); }
-        ffmpegProc.stdin.end();
-      })();
-    });
+    await run('ffmpeg', [
+      '-y',
+      '-framerate', String(fps),
+      '-i', path.join(framesDir, 'frame_%05d.jpg'),
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
+      '-pix_fmt', 'yuv420p', '-an', tempPath
+    ]);
+    // Frames cleanup
+    fs.rmSync(framesDir, { recursive: true, force: true });
 
     // Scale 1080x1920 → target size (decrease+pad — poora content visible rahega)
     await new Promise((resolve, reject) => {
