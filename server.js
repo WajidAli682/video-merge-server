@@ -151,7 +151,9 @@ async function convertGsapToMp4(gsapUrl, duration, width, height, outputPath) {
 </head><body><div id="c"></div>
 <script type="module">
 import { createAnimation } from '${gsapUrl}';
-const anim = createAnimation(document.getElementById('c'));
+// width/height inject karo taake animation sahi size mein render ho
+const userConfig = { width: ${RENDER_W}, height: ${RENDER_H} };
+const anim = createAnimation(document.getElementById('c'), userConfig);
 anim.seek(0);
 window.__anim = anim;
 window.__ready = true;
