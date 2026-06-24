@@ -117,11 +117,22 @@ async function convertGsapToMp4(gsapUrl, duration, width, height, outputPath) {
     throw new Error('Puppeteer/Chromium not installed: ' + e.message);
   }
 
-  // GSAP animation target size mein render karo (width/height parameter se)
-  // Jo bhi project ka size hai (landscape ya portrait), usi mein render karo
-  // 1080x1920 fixed mat karo — GSAP animations project ke size ke liye design hoti hain
-  const RENDER_W = width;
-  const RENDER_H = height;
+  // GSAP ki apni DEFAULT_CONFIG se width/height nikalo
+  // HeyGen bhi yahi karta hai — koi override nahi karta
+  let RENDER_W = width;
+  let RENDER_H = height;
+  try {
+    const gsapCode = await fetch(gsapUrl).then(r => r.text());
+    const wMatch = gsapCode.match(/"width"\s*:\s*(\d+)/);
+    const hMatch = gsapCode.match(/"height"\s*:\s*(\d+)/);
+    if (wMatch && hMatch) {
+      RENDER_W = parseInt(wMatch[1]);
+      RENDER_H = parseInt(hMatch[1]);
+      console.log(`GSAP DEFAULT_CONFIG size: ${RENDER_W}x${RENDER_H}`);
+    }
+  } catch(e) {
+    console.warn('GSAP config fetch failed, using target size:', e.message);
+  }
 
   const browser = await puppeteer.launch({
     args: [
@@ -151,9 +162,9 @@ async function convertGsapToMp4(gsapUrl, duration, width, height, outputPath) {
 </head><body><div id="c"></div>
 <script type="module">
 import { createAnimation } from '${gsapUrl}';
-// width/height inject karo taake animation sahi size mein render ho
-const userConfig = { width: ${RENDER_W}, height: ${RENDER_H} };
-const anim = createAnimation(document.getElementById('c'), userConfig);
+// Koi userConfig inject nahi — GSAP apni DEFAULT_CONFIG use kare
+// HeyGen bhi yahi karta hai
+const anim = createAnimation(document.getElementById('c'));
 anim.seek(0);
 window.__anim = anim;
 window.__ready = true;
@@ -193,8 +204,28 @@ window.__ready = true;
     // Frames cleanup
     fs.rmSync(framesDir, { recursive: true, force: true });
 
-    // tempPath already correct size mein hai — rename karo
-    fs.renameSync(tempPath, outputPath);
+    // Standard size (1920x1080 ya 1080x1920) → target size pe scale karo
+    // decrease+pad: poora content visible rahega, aspect ratio maintain
+    if (RENDER_W !== width || RENDER_H !== height) {
+      await new Promise((resolve, reject) => {
+        const proc = spawn('ffmpeg', [
+          '-y', '-i', tempPath,
+          '-vf', `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`,
+          '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
+          '-pix_fmt', 'yuv420p', '-an', outputPath
+        ]);
+        let stderr = '';
+        proc.stderr.on('data', d => { stderr += d.toString(); });
+        proc.on('close', (code) => {
+          if (code === 0) resolve();
+          else reject(new Error('ffmpeg scale: ' + stderr.slice(-300)));
+        });
+        proc.on('error', reject);
+      });
+      try { fs.unlinkSync(tempPath); } catch(_) {}
+    } else {
+      fs.renameSync(tempPath, outputPath);
+    }
     console.log(`GSAP → MP4 done: ${width}x${height}`, outputPath);
   } catch (e) {
     await browser.close().catch(() => {});
