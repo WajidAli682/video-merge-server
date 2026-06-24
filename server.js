@@ -117,10 +117,11 @@ async function convertGsapToMp4(gsapUrl, duration, width, height, outputPath) {
     throw new Error('Puppeteer/Chromium not installed: ' + e.message);
   }
 
-  // GSAP animation hamesha 1080x1920 design hoti hai (metadata se)
-  // Render 1080x1920 mein karo, phir ffmpeg se target size pe scale karo
-  const RENDER_W = 1080;
-  const RENDER_H = 1920;
+  // GSAP animation target size mein render karo (width/height parameter se)
+  // Jo bhi project ka size hai (landscape ya portrait), usi mein render karo
+  // 1080x1920 fixed mat karo — GSAP animations project ke size ke liye design hoti hain
+  const RENDER_W = width;
+  const RENDER_H = height;
 
   const browser = await puppeteer.launch({
     args: [
@@ -190,23 +191,8 @@ window.__ready = true;
     // Frames cleanup
     fs.rmSync(framesDir, { recursive: true, force: true });
 
-    // Scale 1080x1920 → target size (decrease+pad — poora content visible rahega)
-    await new Promise((resolve, reject) => {
-      const proc = spawn('ffmpeg', [
-        '-y', '-i', tempPath,
-        '-vf', `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=white,setsar=1`,
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
-        '-pix_fmt', 'yuv420p', '-an', outputPath
-      ]);
-      let stderr = '';
-      proc.stderr.on('data', d => { stderr += d.toString(); });
-      proc.on('close', (code) => {
-        if (code === 0) resolve();
-        else reject(new Error('ffmpeg scale: ' + stderr.slice(-300)));
-      });
-      proc.on('error', reject);
-    });
-    try { fs.unlinkSync(tempPath); } catch(_) {}
+    // tempPath already correct size mein hai — rename karo
+    fs.renameSync(tempPath, outputPath);
     console.log(`GSAP → MP4 done: ${width}x${height}`, outputPath);
   } catch (e) {
     await browser.close().catch(() => {});
@@ -535,6 +521,28 @@ async function processJob(jobId, clips, audioClips) {
 }
 
 app.get('/', (req, res) => res.json({ ok: true, service: 'video-merge-server' }));
+
+// GSAP test endpoint — sirf ek clip convert karke download URL deta hai
+// Usage: POST /test-gsap { url, duration, width, height }
+app.post('/test-gsap', (req, res) => {
+  const { url, duration = 7, width = 1278, height = 720 } = req.body || {};
+  if (!url) return res.status(400).json({ error: 'url required' });
+
+  const testId = 'gsap_test_' + Date.now();
+  const testDir = path.join(STORAGE_DIR, testId);
+  fs.mkdirSync(testDir, { recursive: true });
+  const outPath = path.join(testDir, 'test.mp4');
+
+  res.json({ testId, status: 'converting...' });
+
+  convertGsapToMp4(url, duration, width, height, outPath)
+    .then(() => {
+      console.log(`[GSAP Test ${testId}] done — /files/${testId}/test.mp4`);
+    })
+    .catch(err => {
+      console.error(`[GSAP Test ${testId}] FAILED:`, err.message);
+    });
+});
 
 app.post('/merge', (req, res) => {
   const { clips, audio } = req.body || {};
